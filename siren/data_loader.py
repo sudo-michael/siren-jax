@@ -233,8 +233,8 @@ def xy_to_image_array(x, y, width, height):
     w_idx = ((x[:, 0] + 1) / 2) * (width - 1)
     h_idx = ((x[:, 1] + 1) / 2) * (height - 1)
 
-    w_idx = np.around(w_idx).astype(np.int)
-    h_idx = np.around(h_idx).astype(np.int)
+    w_idx = np.around(w_idx).astype(int)
+    h_idx = np.around(h_idx).astype(int)
 
     num_channel = y.shape[-1]
     img_array = np.zeros((width, height, num_channel))

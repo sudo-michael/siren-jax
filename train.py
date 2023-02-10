@@ -5,6 +5,15 @@ from siren.model import get_model_cls_by_type
 from util.log import Logger
 from util.timer import Timer
 
+import optax
+import jax
+import jax.numpy as jnp
+from flax.training.train_state import TrainState
+from flax.training import checkpoints
+from siren.network_flax import Siren
+import orbax
+import orbax.checkpoint as orbax
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SirenHighres")
@@ -59,9 +68,35 @@ def main(args):
     DataLoader = get_data_loader_cls_by_type(args.type)
 
     data_loader = DataLoader(args.file, args.nc, args.size, args.batch_size)
-    model = Model(layers, args.nc, args.omega)
-    optimizer = JaxOptimizer("adam", model, args.lr)
+    # model = Model(layers, args.nc, args.omega)
+    # optimizer = JaxOptimizer("adam", model, args.lr)
 
+    key = jax.random.PRNGKey(0)
+    key, network_key = jax.random.split(key)
+    model = Siren(num_channels=layers, output_dim=1)
+    state = TrainState.create(apply_fn=model.apply, 
+                              params=model.init(network_key, jnp.ones((args.batch_size, 2))),
+                              tx=optax.adam(learning_rate=args.lr))
+
+    @jax.jit
+    def update(state, x, y):
+        def jacobian(apply_fn, params, x):
+            f = lambda x: apply_fn(params, x)
+            y, f_vjp = jax.vjp(f, x)
+            (x_grad,) = f_vjp(jnp.ones_like(y))
+            return x_grad
+            
+        def mse_loss(params):
+            output = jacobian(state.apply_fn, params, x)
+            diff = output - y
+            return jnp.mean(jnp.sum(diff**2, axis=-1))
+        # def mse_loss(params):
+        #     output = state.apply_fn(params, x)
+        #     return jnp.mean((output - y)**2)
+        loss, grads = jax.value_and_grad(mse_loss)(state.params)
+        state = state.apply_gradients(grads=grads)
+        return state, loss
+        
     name = args.file.split(".")[0]
     logger = Logger(name)
     logger.save_option(vars(args))
@@ -75,7 +110,17 @@ def main(args):
 
     def interm_callback(i, data, params):
         log = {}
-        loss = model.loss_func(params, data)
+        # loss = model.loss_func(params, data)
+        log["loss"] = float(loss)
+        log["iter"] = i
+        log["duration_per_iter"] = iter_timer.get_dt() / args.print_iter
+
+        logger.save_log(log)
+        print(log)
+
+    def interm_callback_2(i, loss):
+        log = {}
+        # loss = model.loss_func(params, data)
         log["loss"] = float(loss)
         log["iter"] = i
         log["duration_per_iter"] = iter_timer.get_dt() / args.print_iter
@@ -89,22 +134,38 @@ def main(args):
     total_timer = Timer()
     total_timer.start()
     last_data = None
-    for _ in range(args.epoch):
+    for e in range(args.epoch):
         data_loader = DataLoader(args.file, args.nc, args.size, args.batch_size)
+        total_loss = []
         for data in data_loader:
-            optimizer.step(data)
-            last_data = data
-            if optimizer.iter_cnt % args.print_iter == 0:
-                interm_callback(
-                    optimizer.iter_cnt, data, optimizer.get_optimized_params()
-                )
+              state, loss = update(state, data['input'], data['output'])
+              total_loss.append(loss.item())
+        if e % args.print_iter == 0:
+            ckpt = {'model': state}
+            orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
+            checkpoints.save_checkpoint(ckpt_dir='CKPT_jacob',
+                                        target=ckpt,
+                                        step=e,
+                                        overwrite=False,
+                                        keep=2,
+                                        orbax_checkpointer=orbax_checkpointer)
 
-    if not optimizer.iter_cnt % args.print_iter == 0:
-        interm_callback(optimizer.iter_cnt, data, optimizer.get_optimized_params())
+
+            interm_callback_2(e, jnp.mean(jnp.array(total_loss)))
+        # print(f"epoch {e} loss: {jnp.mean(jnp.array(total_loss))}")
+    #         optimizer.step(data)
+    #         last_data = data
+    #         if optimizer.iter_cnt % args.print_iter == 0:
+    #             interm_callback(
+    #                 optimizer.iter_cnt, data, optimizer.get_optimized_params()
+    #             )
+
+    # if not optimizer.iter_cnt % args.print_iter == 0:
+    #     interm_callback(optimizer.iter_cnt, data, optimizer.get_optimized_params())
 
     train_duration = total_timer.get_dt()
     print("Training Duration: {} sec".format(train_duration))
-    logger.save_net_params(optimizer.get_optimized_params())
+    # logger.save_net_params(optimizer.get_optimized_params())
     logger.save_losses_plot()
 
 
